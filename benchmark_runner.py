@@ -4,9 +4,9 @@ benchmark_runner.py
 ===================
 Benchmarks three audio-LLM models against the telecom pipeline:
 
-  Model A: Qwen/Qwen2-Audio-7B-Instruct           (original, baseline)
-  Model B: openai/whisper-large-v3 + Llama-3-8B-Instruct  (cascade ASR+LLM)
-  Model C: Qwen/Qwen2.5-Omni-7B                   (next-gen multimodal)
+  Model A: Qwen/Qwen3-Omni-30B-A3B-Instruct                   (latest Qwen omni)
+  Model B: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 (hybrid Mamba-Transformer)
+  Model C: openai/whisper-large-v3 + Llama-3-8B-Instruct      (cascade ASR+LLM baseline)
 
 For each model it measures and records:
   1. ASR / audio-encoding latency      (ms)
@@ -32,10 +32,10 @@ Usage:
 
     # Quick smoke test with 20 samples:
     python benchmark_runner.py --db ./customer_db --dataset /dataset_generated \
-                               --max-samples 20 --models qwen2audio
+                               --max-samples 20 --models qwen3omni
 
     # Run only specific models:
-    python benchmark_runner.py --models qwen2audio,cascade --db ./customer_db \
+    python benchmark_runner.py --models nemotron,cascade --db ./customer_db \
                                --dataset /dataset_generated
 """
 
