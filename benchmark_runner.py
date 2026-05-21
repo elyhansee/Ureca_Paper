@@ -2,41 +2,52 @@
 """
 benchmark_runner.py
 ===================
-Benchmarks three audio-LLM models against the telecom pipeline:
+Evaluates multi-modal audio-LLMs and cascade speech-to-text pipelines against 
+an indexed telecom customer database using FAISS vector retrieval and 
+automated semantic grounding evaluation.
 
-  Model A: Qwen/Qwen3-Omni-30B-A3B-Instruct                   (latest Qwen omni)
-  Model B: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 (hybrid Mamba-Transformer)
-  Model C: openai/whisper-large-v3 + Llama-3-8B-Instruct      (cascade ASR+LLM baseline)
+Core functionality:
+  * Overrides core process forks to force process 'spawn' configurations and 
+    translates Slurm/PBS string GPU UUIDs into safe integer indices.
+  * Injects a dynamic builtins.__import__ monkey-patch hook to dynamically register
+    experimental Qwen3/Qwen3.5 architectures within transformers and vLLM runtimes.
+  * Redirects Home, FlashInfer, and Triton JIT compilation caches to writeable 
+    workspaces to bypass read-only container filesystem collisions.
+  * Tracks and isolates granular latency breakdowns across five evaluation dimensions
+    (ASR / encoding overhead, TTFT, FAISS lookup, tool overhead, text decoding).
+  * Measures operational accuracy profiles, containing Tool-Selection Precision/Recall/F1, 
+    FAISS Hit-Rate@K, and semantic grounding (BERTScore/LLM-as-Judge).
 
-For each model it measures and records:
-  1. ASR / audio-encoding latency      (ms)
-  2. Time-to-first-token (TTFT)        (ms)
-  3. FAISS tool retrieval latency      (ms)
-  4. Decoding / generation latency     (ms)
-  5. End-to-end latency                (ms)
-
-Accuracy metrics (via AccuracyTracker + HallucinationJudge):
-  - Tool selection Precision / Recall / F1
-  - FAISS Hit-Rate@1, @3, @5
-  - Mean hallucination score
+Prerequisites (Inputs):
+  - A compiled customer table and trained FAISS vector database index (--db)
+  - A directory of speech evaluation target vectors (--dataset) containing .wav/.mp3/.flac assets
+  - Environment variable tokens (HF_TOKEN) authorizing access to gated model weight catalogs
 
 Outputs:
-  ./results/<model_tag>/traces.csv        – per-sample trace
-  ./results/<model_tag>/accuracy.json     – accuracy summary
-  ./results/<model_tag>/latency.json      – latency percentiles
-  ./results/comparison_report.json        – cross-model comparison
+  - ./results/<model_tag>/traces.csv        – Raw per-sample latencies, arguments, and judge scores
+  - ./results/<model_tag>/accuracy.json     – Aggregated tool matrix, accuracy summary, and hit rates
+  - ./results/<model_tag>/latency.json      – Quantiled latency percentiles (p50, p75, p90, p95, p99)
+  - ./results/comparison_report.json        – Final cross-model evaluation performance report
 
-Usage:
-    # Benchmark all three models sequentially:
-    python benchmark_runner.py --db ./customer_db --dataset /dataset_generated
+Usage (Standard Local Python Environment):
+    python benchmark_runner.py --db ./customer_db --dataset /dataset_generated --max-samples 500
 
-    # Quick smoke test with 20 samples:
-    python benchmark_runner.py --db ./customer_db --dataset /dataset_generated \
-                               --max-samples 20 --models qwen3omni
-
-    # Run only specific models:
-    python benchmark_runner.py --models nemotron,cascade --db ./customer_db \
-                               --dataset /dataset_generated
+Usage (HPC Production Deployment via Singularity SIF Container):
+    singularity exec --nv \
+      --env HF_TOKEN="your_actual_token_here" \
+      --env VLLM_USE_V1=1 \
+      --env HF_HOME=/workspace/tmp_cache/hf \
+      --env PIP_CACHE_DIR=/workspace/tmp_cache/pip \
+      --env XDG_CACHE_HOME=/workspace/tmp_cache \
+      --bind /scratch/users/ntu/es0001an/paper:/workspace \
+      --bind /home/users/ntu/es0001an/scratch/paper/dataset:/dataset \
+      /scratch/users/ntu/es0001an/paper/vllm-omni.sif \
+      /workspace/container_venv/bin/python /workspace/benchmark_runner.py \
+        --db /workspace/customer_db \
+        --dataset /dataset \
+        --models cascade \
+        --judge bertscore \
+        --max-samples 500
 """
 
 import os
@@ -45,22 +56,33 @@ import multiprocessing
 import subprocess
 from pathlib import Path
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── FIX 1: Prevent CUDA Fork Crash (Must be at the very top) ─────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 # vLLM V1 engine uses subprocesses. Since CustomerDB/Judge initialize CUDA in 
 # the main process, forking causes a CUDA context corruption ("driver too old").
 # We force 'spawn' so child processes start with a clean CUDA context.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+# Disable anonymous usage telemetry to prevent container permission crashes
+os.environ["VLLM_NO_USAGE_STATS"] = "1"
+
+# Redirect Home, FlashInfer, and Triton JIT compilation caches to your writeable scratch
+# workspace. This prevents PermissionErrors inside Singularity container environments
+# where the default Home (~/.cache/) filesystem blocks runtime writes.
+os.environ["HOME"] = "/workspace/tmp_cache/home"
+os.environ["FLASHINFER_CACHE_DIR"] = "/workspace/tmp_cache/flashinfer"
+os.environ["TRITON_CACHE_DIR"] = "/workspace/tmp_cache/triton"
+
+try:
+    Path("/workspace/tmp_cache/home").mkdir(parents=True, exist_ok=True)
+    Path("/workspace/tmp_cache/flashinfer").mkdir(parents=True, exist_ok=True)
+    Path("/workspace/tmp_cache/triton").mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
 try:
     multiprocessing.set_start_method("spawn", force=True)
 except RuntimeError:
     pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── FIX 2: CUDA_VISIBLE_DEVICES UUID → index (MUST run before torch import) ──
-# ══════════════════════════════════════════════════════════════════════════════
 def _fix_cuda_visible_devices():
     """
     PBS/Slurm sometimes sets CUDA_VISIBLE_DEVICES to GPU UUIDs like
@@ -108,9 +130,6 @@ def _fix_cuda_visible_devices():
 _fix_cuda_visible_devices()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── FIX 3: Subprocess-safe PyTorch inductor crash patch ──────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 def _disable_torch_compile_globally():
     """
     vLLM spawns subprocesses (via python -m) to inspect model architectures.
@@ -124,9 +143,11 @@ def _disable_torch_compile_globally():
     patch_dir.mkdir(exist_ok=True)
     site_file = patch_dir / "sitecustomize.py"
     
-    code = """
+    code = r"""
 import os
 import sys
+import types
+import builtins
 
 if os.environ.get("VLLM_DISABLE_TORCH_COMPILE") == "1":
     try:
@@ -137,6 +158,113 @@ if os.environ.get("VLLM_DISABLE_TORCH_COMPILE") == "1":
         torch.compile = _noop_compile
     except Exception:
         pass
+
+# Ensure Home and JIT cache variables are redirected in child processes too
+os.environ["HOME"] = "/workspace/tmp_cache/home"
+os.environ["FLASHINFER_CACHE_DIR"] = "/workspace/tmp_cache/flashinfer"
+os.environ["TRITON_CACHE_DIR"] = "/workspace/tmp_cache/triton"
+
+# --- START OF VLLM OMNI PATCH ---
+# Uses a safe, built-in __import__ hook with a re-entrancy lock to patch target modules
+# as soon as they are loaded, keeping sys.modules as a pure dict
+# to prevent any C-extension (like pandas/numpy) import conflicts.
+try:
+    _in_patch = False
+    original_import = builtins.__import__
+
+    def patched_import(name, globals=None, locals=None, fromlist=(), level=0):
+        global _in_patch
+        module = original_import(name, globals, locals, fromlist, level)
+        
+        # Re-entrancy guard: if we are already inside the patcher, execute natively
+        if _in_patch:
+            return module
+            
+        if name == "transformers" or "vllm" in name:
+            _in_patch = True
+            try:
+                # 1. Patch the vLLM Transformers Model Executor class methods if loaded
+                if "vllm.model_executor.models.transformers" in sys.modules:
+                    tf_mod = sys.modules["vllm.model_executor.models.transformers"]
+                    for attr_name in dir(tf_mod):
+                        attr = getattr(tf_mod, attr_name)
+                        if isinstance(attr, type) and hasattr(attr, "get_max_image_tokens"):
+                            original_method = getattr(attr, "get_max_image_tokens")
+                            if not hasattr(original_method, "_is_patched"):
+                                def make_patched_method(orig_m):
+                                    def patched_method(self, *args, **kwargs):
+                                        processor = getattr(self, "processor", None)
+                                        if processor is not None and not hasattr(processor, "_get_num_multimodal_tokens"):
+                                            def dummy_get_tokens(*a, **kw):
+                                                return {"num_image_tokens": [2048]}
+                                            processor._get_num_multimodal_tokens = types.MethodType(dummy_get_tokens, processor)
+                                            print(f"\n[vLLM Patch] Injected _get_num_multimodal_tokens onto {type(processor).__name__} instance!\n", flush=True)
+                                        return orig_m(self, *args, **kwargs)
+                                    patched_method._is_patched = True
+                                    return patched_method
+                                setattr(attr, "get_max_image_tokens", make_patched_method(original_method))
+                                print(f"[vLLM Patch] Successfully wrapped {attr_name}.get_max_image_tokens", flush=True)
+                
+                # 2. Patch the lazy-loaded Qwen3OmniMoeProcessor and AutoModel Config Registry
+                if "transformers" in sys.modules:
+                    trans_mod = sys.modules["transformers"]
+                    if hasattr(trans_mod, "Qwen3OmniMoeProcessor"):
+                        cls = getattr(trans_mod, "Qwen3OmniMoeProcessor")
+                        if not hasattr(cls, "_get_num_multimodal_tokens"):
+                            def _dummy_get_num_multimodal_tokens(self, *args, **kwargs):
+                                return {"num_image_tokens": [2048]}
+                            cls._get_num_multimodal_tokens = _dummy_get_num_multimodal_tokens
+                            print(f"\n[vLLM Patch] Dynamic Hook successfully injected _get_num_multimodal_tokens into {cls.__name__}\n", flush=True)
+                    
+                    # Intercept and register the Qwen3 config mapping into the AutoModel base class
+                    if hasattr(trans_mod, "Qwen3OmniMoeConfig") and hasattr(trans_mod, "AutoModel"):
+                        config_cls = getattr(trans_mod, "Qwen3OmniMoeConfig")
+                        auto_model_cls = getattr(trans_mod, "AutoModel")
+                        
+                        # Only register if not already completed to prevent loop spamming
+                        if not getattr(auto_model_cls, "_qwen3_registered", False):
+                            model_cls = None
+                            for target in ("Qwen3OmniMoeModel", "Qwen3OmniMoeForCausalLM", "Qwen3OmniMoeForConditionalGeneration"):
+                                if hasattr(trans_mod, target):
+                                    model_cls = getattr(trans_mod, target)
+                                    break
+                            if model_cls:
+                                auto_model_cls.register(config_cls, model_cls)
+                                auto_model_cls._qwen3_registered = True
+                                print(f"\n[vLLM Patch] Registered {config_cls.__name__} under AutoModel with {model_cls.__name__}\n", flush=True)
+
+                    # 3. Intercept and register the qwen3_5 config mapping into AutoConfig
+                    if hasattr(trans_mod, "AutoConfig"):
+                        auto_config_cls = getattr(trans_mod, "AutoConfig")
+                        base_config = None
+                        for fallback_name in ("Qwen2Config", "LlamaConfig", "PreTrainedConfig"):
+                            if hasattr(trans_mod, fallback_name):
+                                base_config = getattr(trans_mod, fallback_name)
+                                break
+                        if base_config:
+                            class Qwen3_5Config(base_config):
+                                model_type = "qwen3_5"
+                            auto_config_cls.register("qwen3_5", Qwen3_5Config)
+                            print(f"\n[vLLM Patch] Registered qwen3_5 under AutoConfig inheriting from {base_config.__name__}\n", flush=True)
+
+                # 4. Patch vLLM task configuration mappings
+                if "vllm.config" in sys.modules:
+                    v_config = sys.modules["vllm.config"]
+                    if hasattr(v_config, "_RUNNER_TASKS"):
+                        for arch in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"):
+                            if arch not in v_config._RUNNER_TASKS["generate"]:
+                                v_config._RUNNER_TASKS["generate"].append(arch)
+                                print(f"\n[vLLM Patch] Registered {arch} under generative tasks\n", flush=True)
+            except Exception as e:
+                pass
+            finally:
+                _in_patch = False
+        return module
+
+    builtins.__import__ = patched_import
+except Exception:
+    pass
+# --- END OF VLLM OMNI PATCH ---
 
 try:
     patch_dir = os.path.dirname(__file__)
@@ -200,6 +328,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, List, Tuple, Any
 
 import torch
+import transformers
 
 from retrieval_engine import (
     CustomerDB, AccuracyTracker, AccuracyEvent,
@@ -209,6 +338,44 @@ from hallucination_judge import HallucinationJudge, JudgeConfig
 
 
 SEED = 42
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── FIX 5: Parent process config registration hook ───────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+def _register_compat_architectures():
+    """
+    Directly patch the main thread's local transformers instance in case standard
+    imports require config translation for qwen3_5. Also patch task mappings 
+    in parent process if vllm is subsequently imported.
+    """
+    try:
+        if hasattr(transformers, "AutoConfig"):
+            ac = transformers.AutoConfig
+            base_cfg = None
+            for name in ("Qwen2Config", "LlamaConfig", "PreTrainedConfig"):
+                if hasattr(transformers, name):
+                    base_cfg = getattr(transformers, name)
+                    break
+            if base_cfg:
+                class Qwen3_5Config(base_cfg):
+                    model_type = "qwen3_5"
+                ac.register("qwen3_5", Qwen3_5Config)
+                print(f"[INIT] Registered qwen3_5 architecture compatibility with transformers (inherits {base_cfg.__name__})")
+        
+        try:
+            import vllm.config as v_config
+            if hasattr(v_config, "_RUNNER_TASKS"):
+                for arch in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"):
+                    if arch not in v_config._RUNNER_TASKS["generate"]:
+                        v_config._RUNNER_TASKS["generate"].append(arch)
+                print(f"[INIT] Registered Qwen3.5 architectures under vLLM generative tasks")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[WARN] Failed to register compat architectures: {e}")
+
+_register_compat_architectures()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -231,22 +398,22 @@ class ModelConfig:
 
 
 MODEL_CATALOGUE: Dict[str, ModelConfig] = {
-    # ── Qwen3-Omni-30B-A3B-Instruct (2026) ───────────────────────────────────
+    # ── Qwen3-Omni-30B-A3B-Instruct AWQ 4-bit (2026) ──────────────────────────
     "qwen3omni": ModelConfig(
         tag="qwen3omni",
-        display_name="Qwen3-Omni-30B-A3B",
-        model_id="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        display_name="Qwen3-Omni-30B-A3B-AWQ",
+        model_id="cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit",
         architecture="omni",
         gpu_memory_util=0.85,
         max_model_len=32768,
         limit_mm={"audio": 1},
-        extra_kwargs={"enforce_eager": True},
+        extra_kwargs={"enforce_eager": True, "quantization": "awq"},
     ),
-    # ── NVIDIA Nemotron-3-Nano-Omni-30B-A3B (April 28 2026) ──────────────────
+    # ── NVIDIA Nemotron-3-Nano-Omni-30B-FP8 (April 2026) ──────────────────────
     "nemotron": ModelConfig(
         tag="nemotron",
-        display_name="Nemotron-3-Nano-Omni-30B-A3B",
-        model_id="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+        display_name="Nemotron-3-Nano-Omni-30B-FP8",
+        model_id="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
         architecture="nemotron_omni",
         gpu_memory_util=0.85,
         max_model_len=32768,
@@ -254,11 +421,11 @@ MODEL_CATALOGUE: Dict[str, ModelConfig] = {
         limit_mm={"audio": 1},
         extra_kwargs={"enforce_eager": True},
     ),
-    # ── Cascade baseline: Whisper-large-v3 → Llama-3-8B ──────────────────────
+    # ── Cascade baseline: Qwen2.5-7B-Instruct (Natively Supported) ────────────
     "cascade": ModelConfig(
         tag="cascade",
-        display_name="Whisper-large-v3 → Llama-3-8B",
-        model_id="meta-llama/Meta-Llama-3-8B-Instruct",
+        display_name="Qwen2.5-7B-Instruct",
+        model_id="Qwen/Qwen2.5-7B-Instruct",
         architecture="cascade",
         asr_model_id="openai/whisper-large-v3",
         gpu_memory_util=0.60,
@@ -268,7 +435,7 @@ MODEL_CATALOGUE: Dict[str, ModelConfig] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt ────────────────────────────────═════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant for a telecom company.\n"
@@ -318,7 +485,7 @@ class LatencyRecord:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────═══════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_tool_call(text: str) -> Optional[Tuple[str, Dict]]:
     text = text.strip()
@@ -408,7 +575,7 @@ def infer_label(filename: str, dataset_dir: str = "") -> SampleLabel:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Model runners ─────────────────────────────────────────────────────────────
+# ── Model runners ────────────────────────────────═════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 class BaseRunner:
     def __init__(self, config: ModelConfig):
@@ -541,12 +708,17 @@ class NemotronOmniRunner(BaseRunner):
         }
 
 
-# ── Cascade runner (Whisper → Llama) ─────────────────────────────────────────
+# ── Cascade baseline: Whisper-large-v3 → Qwen2.5-7B (Highly Compatible) ──────
 class CascadeRunner(BaseRunner):
     def load(self):
         import whisper
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model_name = (self.config.asr_model_id or "openai/whisper-large-v3").split("/")[-1]
+        
+        # Strip whisper- prefix for openai-whisper package compatibility
+        if model_name.startswith("whisper-"):
+            model_name = model_name.replace("whisper-", "")
+            
         print(f"  [LOAD] Whisper {model_name} on {device}")
         self.whisper = whisper.load_model(model_name, device=device)
 
@@ -561,17 +733,12 @@ class CascadeRunner(BaseRunner):
 
     def _make_llm_prompt(self, transcript: str, tool_result: str = "") -> str:
         body = (
-            f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-            f"{SYSTEM_PROMPT}<|eot_id|>\n"
-            f"<|start_header_id|>user<|end_header_id|>\n"
-            f"{transcript}<|eot_id|>\n"
+            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{transcript}<|im_end|>\n"
         )
         if tool_result:
-            body += (
-                f"<|start_header_id|>tool<|end_header_id|>\n"
-                f"{tool_result}<|eot_id|>\n"
-            )
-        body += "<|start_header_id|>assistant<|end_header_id|>\n"
+            body += f"<|im_start|>tool\n{tool_result}<|im_end|>\n"
+        body += "<|im_start|>assistant\n"
         return body
 
     def run_sample(self, audio: np.ndarray, sr: int,
@@ -755,9 +922,12 @@ def run_model_benchmark(
         })
         (out_dir / f"{base}_synthesis.txt").write_text(synth_text)
         latencies.append(lr)
+        
+        # Evaluate formatted hallucination string prior to interpolation inside print log
+        h_str = f"{h_score:.3f}" if h_score is not None else "N/A"
         print(f"  [{idx+1:>4}/{len(items)}] {base}  "
               f"e2e={lr.e2e_ms:.0f}ms  stage=tool_synthesis  "
-              f"h={h_score:.3f if h_score is not None else 'N/A'}")
+              f"h={h_str}")
 
     runner.unload()
 
