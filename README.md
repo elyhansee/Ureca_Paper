@@ -159,6 +159,3 @@ singularity exec --nv \
 * **Balanced Sampling:** Audio datasets are deterministically shuffled using a stable seed prior to limiting via `--max-samples`, ensuring a statistically balanced mix of general-inquiry and tool-lookup audio files are processed during truncated smoke tests.
 * **IVFFlat over Flat:** At 1M–10M records, exact `IndexFlatL2` takes 500ms–5s per search. IVFFlat reduces this to 5–60ms while maintaining >95% recall vs. exact search.
 
-```
-
-```
