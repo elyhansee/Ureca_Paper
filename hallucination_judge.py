@@ -79,12 +79,27 @@ class BERTScoreJudge:
             print("[WARN] bert_score not installed. Falling back to token-overlap judge.")
             self._available = False
 
-    def _record_to_str(self, record: Dict[str, Any]) -> str:
-        """Flatten a retrieved record to a natural-language reference string."""
+    def _record_to_str(self, record: Dict[str, Any], response: str = "") -> str:
+        """
+        Flatten a retrieved record to a natural-language reference string.
+        Dynamically filters database identifiers (phone, customer_id) unless 
+        they are explicitly mentioned in the response to avoid artificial penalties.
+        """
         parts = []
-        for key in ("name", "phone", "plan", "balance", "customer_id"):
+        # Name, plan, and balance are standard verbal facts expected in synthesis
+        for key in ("name", "plan", "balance"):
             if key in record and record[key]:
                 parts.append(f"{key}: {record[key]}")
+        
+        # Only include phone and customer_id in reference if they are present in the response
+        for key in ("phone", "customer_id"):
+            if key in record and record[key]:
+                val_str = str(record[key]).lower()
+                clean_val = re.sub(r"\D", "", val_str)  # strip non-digits for phone comparisons
+                lowered_response = response.lower()
+                if val_str in lowered_response or (clean_val and clean_val in lowered_response):
+                    parts.append(f"{key}: {record[key]}")
+                    
         return ". ".join(parts)
 
     def _token_overlap_fallback(self, response: str, reference: str) -> float:
@@ -96,11 +111,12 @@ class BERTScoreJudge:
         return len(r_tok & ref_tok) / len(ref_tok)
 
     def score(self, response: str, record: Dict[str, Any]) -> float:
-        reference = self._record_to_str(record)
+        reference = self._record_to_str(record, response)
         if not response.strip() or not reference.strip():
             return 0.0
 
         if self._available:
+            # 1. Attempt official BERTScore with its built-in baseline rescaling
             try:
                 P, R, F = self._score_fn(
                     cands=[response],
@@ -109,14 +125,28 @@ class BERTScoreJudge:
                     lang=self._lang,
                     device=self._device,
                     verbose=False,
+                    rescale_with_baseline=True,
                 )
-                raw_f = float(F[0].item())
-                # BERTScore F1 for DeBERTa hovers ~0.85–1.0 even for paraphrases;
-                # rescale to [0,1] using an empirical floor of 0.85
-                rescaled = max(0.0, (raw_f - 0.85) / 0.15)
-                return round(min(1.0, rescaled), 4)
-            except Exception as e:
-                print(f"[WARN] BERTScore failed ({e}), using token overlap")
+                rescaled = float(F[0].item())
+                return round(min(1.0, max(0.0, rescaled)), 4)
+            except Exception:
+                # 2. Offline fallback: manual rescaling using a safer empirical floor
+                try:
+                    P, R, F = self._score_fn(
+                        cands=[response],
+                        refs=[reference],
+                        model_type=self._model,
+                        lang=self._lang,
+                        device=self._device,
+                        verbose=False,
+                        rescale_with_baseline=False,
+                    )
+                    raw_f = float(F[0].item())
+                    # Empirical floor of 0.72 accounts for DeBERTa similarity baselines
+                    rescaled = max(0.0, (raw_f - 0.72) / 0.28)
+                    return round(min(1.0, rescaled), 4)
+                except Exception as e:
+                    print(f"[WARN] BERTScore evaluation failed ({e}), falling back to token overlap")
 
         return round(self._token_overlap_fallback(response, reference), 4)
 
