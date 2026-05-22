@@ -125,6 +125,7 @@ class CustomerDB:
                dist_threshold: float = 2.0) -> Dict[str, Any]:
         """
         Embed query, search FAISS, return top-k results with distances.
+        Optimized to perform fast exact string matching on phone numbers first.
 
         Returns dict with:
           status        : "success" | "not_found" | "below_threshold"
@@ -133,6 +134,43 @@ class CustomerDB:
           search_latency_ms : float
         """
         t0 = time.perf_counter()
+
+        # ── Optimization: Exact Phone Number Matching Pathway ──────────────────
+        # Extract digits from the query to verify if it represents a phone string
+        clean_query = "".join(c for c in query if c.isdigit())
+        
+        if clean_query and len(clean_query) >= 7:
+            # 1. Check for exact literal match on raw string
+            match = self.df[self.df["phone"] == query]
+            
+            # 2. Check for exact match removing leading '+' sign if query had one
+            if match.empty and query.startswith("+"):
+                match = self.df[self.df["phone"] == query[1:]]
+                
+            # 3. Clean fallback matching to reconcile spacing/punctuation differences
+            if match.empty:
+                # Remove punctuation from database column to match query format
+                db_clean = self.df["phone"].str.replace(r"\D", "", regex=True)
+                match = self.df[db_clean == clean_query]
+                
+            if not match.empty:
+                hits = []
+                for rank, (idx, row) in enumerate(match.head(k).iterrows(), 1):
+                    hits.append({
+                        "rank":     rank,
+                        "id":       row["id"],
+                        "name":     row["name"],
+                        "phone":    row["phone"],
+                        "plan":     row["plan"],
+                        "balance":  row["balance"],
+                        "distance": 0.0,
+                    })
+                search_ms = (time.perf_counter() - t0) * 1000
+                return {"status": "success", "hits": hits,
+                        "best_distance": 0.0,
+                        "search_latency_ms": round(search_ms, 2)}
+
+        # ── Fallback Pathway: Semantic Vector Index Search ────────────────────
         qe = self.embedder.encode([query])
         distances, indices = self.index.search(qe, k=k)
         search_ms = (time.perf_counter() - t0) * 1000
