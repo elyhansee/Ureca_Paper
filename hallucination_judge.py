@@ -68,6 +68,24 @@ class BERTScoreJudge:
 
     def __init__(self, model: str = "microsoft/deberta-xlarge-mnli",
                  lang: str = "en", device: str = "cpu"):
+        
+        # --- PATCH TO PREVENT OVERFLOW IN TRANSFORMERS >= 5.0 ---
+        try:
+            from transformers import AutoTokenizer
+            if not getattr(AutoTokenizer, "_is_patched_for_max_length", False):
+                orig_from_pretrained = AutoTokenizer.from_pretrained
+                def patched_from_pretrained(*args, **kwargs):
+                    tokenizer = orig_from_pretrained(*args, **kwargs)
+                    # If model_max_length is set to a giant default integer, cap it to 512
+                    if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length > 100000:
+                        tokenizer.model_max_length = 512
+                    return tokenizer
+                AutoTokenizer.from_pretrained = patched_from_pretrained
+                AutoTokenizer._is_patched_for_max_length = True
+        except Exception:
+            pass
+        # --------------------------------------------------------
+
         try:
             from bert_score import score as bert_score_fn
             self._score_fn = bert_score_fn
@@ -149,7 +167,6 @@ class BERTScoreJudge:
                     print(f"[WARN] BERTScore evaluation failed ({e}), falling back to token overlap")
 
         return round(self._token_overlap_fallback(response, reference), 4)
-
 
 # ── LLM Judge ─────────────────────────────────────────────────────────────────
 class LLMJudge:
