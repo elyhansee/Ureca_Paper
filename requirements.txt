@@ -1,0 +1,25 @@
+# Core
+torch>=2.1.0
+transformers>=4.44.0
+vllm>=0.5.0
+numpy>=1.24.0
+pandas>=2.0.0
+soundfile>=0.12.1
+pyarrow>=14.0.0          # for parquet I/O
+
+# FAISS - install the GPU variant if CUDA is available
+faiss-cpu>=1.7.4         # CPU: pip install faiss-cpu
+# faiss-gpu>=1.7.4       # GPU: pip install faiss-gpu
+
+# Hallucination judge
+bert-score>=0.3.13        # BERTScore judge
+# Provides: bert_score.score()
+
+# Cascade ASR (only needed for --models cascade)
+openai-whisper>=20231117  # pip install openai-whisper
+
+# Visualisation
+matplotlib>=3.8.0
+
+# Utilities
+tqdm>=4.66.0
