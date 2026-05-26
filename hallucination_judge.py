@@ -91,7 +91,7 @@ class BERTScoreJudge:
             self._score_fn = bert_score_fn
             self._model    = model
             self._lang     = lang
-            self._device   = device
+            self._device   = "cpu"  # Force CPU execution to bypass CUDA NVRTC JIT errors
             self._available = True
         except ImportError:
             print("[WARN] bert_score not installed. Falling back to token-overlap judge.")
