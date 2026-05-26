@@ -156,6 +156,21 @@ if os.environ.get("VLLM_DISABLE_TORCH_COMPILE") == "1":
             if fn is None: return lambda f: f
             return fn
         torch.compile = _noop_compile
+        
+        # Patch torch.prod on CUDA to bypass NVRTC compilation and resolve libnvrtc-builtins issues
+        orig_prod = torch.Tensor.prod
+        def patched_prod(self, *args, **kwargs):
+            if self.is_cuda:
+                return orig_prod(self.cpu(), *args, **kwargs).cuda()
+            return orig_prod(self, *args, **kwargs)
+        torch.Tensor.prod = patched_prod
+
+        orig_torch_prod = torch.prod
+        def patched_torch_prod(input, *args, **kwargs):
+            if isinstance(input, torch.Tensor) and input.is_cuda:
+                return orig_torch_prod(input.cpu(), *args, **kwargs).cuda()
+            return orig_torch_prod(input, *args, **kwargs)
+        torch.prod = patched_torch_prod
     except Exception:
         pass
 
@@ -183,7 +198,7 @@ try:
         if name == "transformers" or "vllm" in name:
             _in_patch = True
             try:
-                # 1. Patch the vLLM Transformers Model Executor class methods if loaded
+                # Patch the vLLM Transformers Model Executor class methods if loaded
                 if "vllm.model_executor.models.transformers" in sys.modules:
                     tf_mod = sys.modules["vllm.model_executor.models.transformers"]
                     for attr_name in dir(tf_mod):
@@ -205,7 +220,7 @@ try:
                                 setattr(attr, "get_max_image_tokens", make_patched_method(original_method))
                                 print(f"[vLLM Patch] Successfully wrapped {attr_name}.get_max_image_tokens", flush=True)
                 
-                # 2. Patch the lazy-loaded Qwen3OmniMoeProcessor and AutoModel Config Registry
+                #Patch the lazy-loaded Qwen3OmniMoeProcessor and AutoModel Config Registry
                 if "transformers" in sys.modules:
                     trans_mod = sys.modules["transformers"]
                     if hasattr(trans_mod, "Qwen3OmniMoeProcessor"):
@@ -233,7 +248,7 @@ try:
                                 auto_model_cls._qwen3_registered = True
                                 print(f"\n[vLLM Patch] Registered {config_cls.__name__} under AutoModel with {model_cls.__name__}\n", flush=True)
 
-                    # 3. Intercept and register the qwen3_5 config mapping into AutoConfig
+                    # Intercept and register the qwen3_5 config mapping into AutoConfig
                     if hasattr(trans_mod, "AutoConfig"):
                         auto_config_cls = getattr(trans_mod, "AutoConfig")
                         base_config = None
@@ -247,7 +262,7 @@ try:
                             auto_config_cls.register("qwen3_5", Qwen3_5Config)
                             print(f"\n[vLLM Patch] Registered qwen3_5 under AutoConfig inheriting from {base_config.__name__}\n", flush=True)
 
-                # 4. Patch vLLM task configuration mappings
+                # Patch vLLM task configuration mappings
                 if "vllm.config" in sys.modules:
                     v_config = sys.modules["vllm.config"]
                     if hasattr(v_config, "_RUNNER_TASKS"):
@@ -293,13 +308,31 @@ except ImportError:
         if fn is None: return lambda f: f
         return fn
     torch.compile = _noop_compile
+    
+    try:
+        # Patch torch.prod on CUDA for the parent process
+        orig_prod = torch.Tensor.prod
+        def patched_prod(self, *args, **kwargs):
+            if self.is_cuda:
+                return orig_prod(self.cpu(), *args, **kwargs).cuda()
+            return orig_prod(self, *args, **kwargs)
+        torch.Tensor.prod = patched_prod
+
+        orig_torch_prod = torch.prod
+        def patched_torch_prod(input, *args, **kwargs):
+            if isinstance(input, torch.Tensor) and input.is_cuda:
+                return orig_torch_prod(input.cpu(), *args, **kwargs).cuda()
+            return orig_torch_prod(input, *args, **kwargs)
+        torch.prod = patched_torch_prod
+    except Exception:
+        pass
     print(f"[INIT] torch.compile globally disabled via sitecustomize (dir: {abs_patch_dir})")
 
 _disable_torch_compile_globally()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── FIX 4: Suppress Transformers v4 deprecation noise ────────────────────────
+# ── Suppress Transformers v4 deprecation noise ────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 import warnings
 warnings.filterwarnings(
@@ -341,7 +374,7 @@ SEED = 42
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── FIX 5: Parent process config registration hook ───────────────────────────
+# ── Parent process config registration hook ───────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 def _register_compat_architectures():
     """
@@ -407,16 +440,16 @@ MODEL_CATALOGUE: Dict[str, ModelConfig] = {
         gpu_memory_util=0.85,
         max_model_len=32768,
         limit_mm={"audio": 1},
-        extra_kwargs={"enforce_eager": True, "quantization": "awq"},
+        extra_kwargs={"enforce_eager": True, "quantization": "compressed-tensors"},
     ),
     # ── NVIDIA Nemotron-3-Nano-Omni-30B-FP8 (April 2026) ──────────────────────
     "nemotron": ModelConfig(
         tag="nemotron",
-        display_name="Nemotron-3-Nano-Omni-30B-FP8",
-        model_id="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+        display_name="Nemotron-3-Nano-Omni-30B-BF16",
+        model_id="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
         architecture="nemotron_omni",
         gpu_memory_util=0.85,
-        max_model_len=32768,
+        max_model_len=8192,  # Cap context length slightly to preserve VRAM budget for KV Cache
         trust_remote=True,
         limit_mm={"audio": 1},
         extra_kwargs={"enforce_eager": True},
@@ -642,7 +675,7 @@ class Qwen3OmniRunner(BaseRunner):
 
     def _make_prompt(self, audio: np.ndarray, sr: int,
                      tool_result: str = "") -> Dict:
-        ph = "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>\n"
+        ph = "<|audio_start|><|audio_pad|><|audio_end|>"
         body = (
             f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{ph}What can I help you with?<|im_end|>\n"
@@ -681,7 +714,7 @@ class NemotronOmniRunner(BaseRunner):
 
     def _make_prompt(self, audio: np.ndarray, sr: int,
                      tool_result: str = "") -> Dict:
-        ph = "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>\n"
+        ph = "<audio_context>"
         body = (
             f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{ph}What can I help you with?<|im_end|>\n"
@@ -1007,6 +1040,29 @@ def main():
         if r:
             items.append((Path(path).stem, path, r[0], r[1]))
     print(f"  Valid: {len(items)}")
+    import random
+    random.seed(42)
+    
+    # Stratified split to guarantee a perfect 50/50 mix
+    lookup_items = [x for x in items if x[0].lower().startswith("lookup_") or x[0].lower().startswith("tool_")]
+    general_items = [x for x in items if x[0].lower().startswith("general_")]
+    
+    random.shuffle(lookup_items)
+    random.shuffle(general_items)
+    
+    interleaved = []
+    for l, g in zip(lookup_items, general_items):
+        interleaved.append(l)
+        interleaved.append(g)
+        
+    # Append any remaining files
+    min_len = min(len(lookup_items), len(general_items))
+    leftovers = lookup_items[min_len:] + general_items[min_len:]
+    random.shuffle(leftovers)
+    interleaved.extend(leftovers)
+    
+    items[:] = interleaved
+    print(f"  [INFO] Stratified and interleaved {len(lookup_items)} lookup and {len(general_items)} general files to guarantee a perfect 50/50 mix.")
     if not items:
         print("[ERROR] No valid audio files. Exiting.")
         return
