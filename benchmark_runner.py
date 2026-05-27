@@ -685,7 +685,7 @@ class Qwen3OmniRunner(BaseRunner):
         body += "<|im_start|>assistant\n"
         return {
             "prompt": body,
-            "multi_modal_data": {"audio": [(np.array(audio, copy=True), sr)]},
+            "multi_modal_data": {"audio": (np.array(audio, copy=True), sr)},
         }
 
     def run_sample(self, audio: np.ndarray, sr: int,
@@ -713,8 +713,8 @@ class NemotronOmniRunner(BaseRunner):
         self._unload_llm()
 
     def _make_prompt(self, audio: np.ndarray, sr: int,
-                     tool_result: str = "") -> Dict:
-        ph = "<audio_context>"
+                 tool_result: str = "") -> Dict:
+        ph = "<so_embedding>"
         body = (
             f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{ph}What can I help you with?<|im_end|>\n"
