@@ -844,7 +844,62 @@ def run_model_benchmark(
     latencies: List[LatencyRecord] = []
 
     items = audio_items[:max_samples] if max_samples > 0 else audio_items
-
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    already_done = set()
+    if trace_path and os.path.exists(trace_path):
+        try:
+            import csv as _csv
+            with open(trace_path) as f:
+                for row in _csv.DictReader(f):
+                    status = row.get("status", "")
+                    if status.startswith("success") or status == "success":
+                        # 1. Reconstruct Latency Record
+                        lr = LatencyRecord(
+                            sample_id=row["sample_id"],
+                            model_tag=row["model_tag"],
+                            asr_ms=float(row["asr_ms"]) if row["asr_ms"] else 0.0,
+                            ttft_ms=float(row["ttft_ms"]) if row["ttft_ms"] else 0.0,
+                            faiss_ms=float(row["faiss_ms"]) if row["faiss_ms"] else 0.0,
+                            tool_exec_ms=float(row["tool_exec_ms"]) if row["tool_exec_ms"] else 0.0,
+                            decode_ms=float(row["decode_ms"]) if row["decode_ms"] else 0.0,
+                            e2e_ms=float(row["e2e_ms"]) if row["e2e_ms"] else 0.0,
+                            tokens_generated=int(row["tokens_generated"]) if row["tokens_generated"] else 0,
+                            stage=row["stage"],
+                            status=row["status"],
+                        )
+                        latencies.append(lr)
+                        
+                        # 2. Reconstruct Accuracy & FAISS metrics
+                        label = infer_label(row["sample_id"], dataset_dir)
+                        if row.get("tool_called") == "True" or row.get("tool_called") is True:
+                            try:
+                                t_args = json.loads(row["tool_args"]) if row["tool_args"] else {}
+                            except Exception:
+                                t_args = {}
+                            executor.execute(row["tool_name"], t_args, label=label)
+                        else:
+                            tracker.record(AccuracyEvent(
+                                sample_id=label.sample_id,
+                                predicted_tool=False,
+                                true_tool=label.requires_tool,
+                            ))
+                        
+                        # 3. Restore Hallucination scores
+                        h_val = row.get("hallucination_score")
+                        if h_val:
+                            try:
+                                tracker.set_hallucination_score(label.sample_id, float(h_val))
+                            except Exception:
+                                pass
+                        
+                        already_done.add(row["sample_id"])
+            if already_done:
+                before = len(items)
+                items = [x for x in items if x[0] not in already_done]
+                print(f"  [RESUME] Loaded {len(already_done)} historical traces. Skipping completed samples, "
+                    f"resuming from {len(items)} remaining")
+        except Exception as e:
+            print(f"  [RESUME] Could not read traces: {e}")
     RunnerClass = RUNNER_MAP.get(model_cfg.architecture)
     if RunnerClass is None:
         raise ValueError(f"Unknown architecture: {model_cfg.architecture}")
