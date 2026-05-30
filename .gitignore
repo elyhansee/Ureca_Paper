@@ -1,0 +1,25 @@
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Multimodal vLLM local patches
+.vllm_patch/
+
+# Environment caches and local databases
+tmp_cache/
+workspace_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+container_venv/
+
+# Large database directories (to prevent committing raw FAISS index files)
+customer_db/
+
+# System-specific files
+.DS_Store
+Thumbs.db
