@@ -39,13 +39,13 @@ Usage (HPC Production Deployment via Singularity SIF Container):
       --env HF_HOME=/workspace/tmp_cache/hf \
       --env PIP_CACHE_DIR=/workspace/tmp_cache/pip \
       --env XDG_CACHE_HOME=/workspace/tmp_cache \
-      --bind /scratch/users/ntu/es0001an/paper:/workspace \
-      --bind /home/users/ntu/es0001an/scratch/paper/dataset:/dataset \
-      /scratch/users/ntu/es0001an/paper/vllm-omni.sif \
+      --bind /path/to/your/project_directory:/workspace \
+      --bind /path/to/your/audio_dataset_directory:/dataset \
+      /path/to/your/vllm-omni.sif \
       /workspace/container_venv/bin/python /workspace/benchmark_runner.py \
         --db /workspace/customer_db \
         --dataset /dataset \
-        --models cascade \
+        --models cascade,qwen3omni,nemotron \
         --judge bertscore \
         --max-samples 500
 """
