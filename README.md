@@ -34,6 +34,8 @@ Audio Input
 | File / Folder | Purpose |
 |---|---|
 | `generate_customer_db.py` | Generates synthetic 1M customer DB + FAISS IVFFlat index |
+| `generate_test_audio.py`	| Generates synthetic speech queries (audio waveforms) + labels via local TTS |
+| `combine_datasets.py` | Consolidates synthetic tool-use speech waveforms and labels into your main |
 | `retrieval_engine.py` | CustomerDB logic, AccuracyTracker, and ToolExecutor |
 | `hallucination_judge.py` | BERTScore + LLM-as-Judge hallucination scorer |
 | `benchmark_runner.py` | Multi-model benchmarking with granular latency tracing |
@@ -120,6 +122,12 @@ pip install vllm-omni faiss-gpu-cu12 av
 ```bash
 # 1 million records (~2 min on GPU)
 python generate_customer_db.py --n 1_000_000 --out ./customer_db
+
+# Synthesize the 100 tool-use audio files and tool_labels.json
+python generate_test_audio.py
+
+# Merge the synthetic dataset and tool labels into ./dataset/labels.json
+python combine_datasets.py
 ```
 
 ### 3. Run the benchmark
