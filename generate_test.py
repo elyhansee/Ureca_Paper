@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""
+generate_test_audio.py
+======================
+Generates synthetic telecom customer speech queries (audio waveforms) and 
+associated ground-truth labels using offline Text-to-Speech (TTS) synthesis.
+
+Core functionality:
+  * Automatically initializes the target dataset directory if not present locally.
+  * Normalizes voice synthesis properties (e.g., speech rate) using the pyttsx3 
+    multi-platform text-to-speech engine.
+  * Expands customer demographic targets and voice intents (20 templates × 5 profiles) 
+    using a Cartesian product to generate 100 distinct dialogue contexts.
+  * Queues synthetic voice renders asynchronously and batches wave file generation 
+    via pyttsx3's queue loop to prevent engine blockages.
+  * Generates an aligned, structured metadata label file mapping each synthesized 
+    audio asset to its respective intent, phone number, customer ID, and text.
+
+Prerequisites (Inputs):
+  - A Python environment with pyttsx3 installed (`pip install pyttsx3`)
+  - Platform-native TTS libraries installed on the host OS:
+    * Windows: SAPI5 (Standard out-of-the-box)
+    * macOS: NSSpeechSynthesizer (Standard out-of-the-box)
+    * Linux: espeak-ng (`sudo apt-get install espeak-ng`)
+
+Outputs:
+  - ./tool_test_audio/                     – Target workspace for synthesized files
+  - ./tool_test_audio/tool_mass_*.wav      – 100 synthesized audio query clips
+  - ./tool_test_audio/tool_labels.json     – Ground-truth evaluation metadata maps
+
+Usage:
+    python generate_test_audio.py
+"""
+
 import json
 import pyttsx3
 import itertools
