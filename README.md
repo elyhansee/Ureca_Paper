@@ -37,8 +37,7 @@ Audio Input
 | `retrieval_engine.py` | CustomerDB logic, AccuracyTracker, and ToolExecutor |
 | `hallucination_judge.py` | BERTScore + LLM-as-Judge hallucination scorer |
 | `benchmark_runner.py` | Multi-model benchmarking with granular latency tracing |
-| `results/` | Pre-computed benchmark results (comparison_report.json) |
-| `images/` | Rendered evaluation charts for the publication |
+| `results/` | Pre-computed benchmark results (comparison_report.json) and Rendered evaluation charts for the publication |
 
 ---
 
