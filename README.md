@@ -147,13 +147,13 @@ singularity exec --nv \
   --env HF_HOME=/workspace/tmp_cache/hf \
   --env PIP_CACHE_DIR=/workspace/tmp_cache/pip \
   --env XDG_CACHE_HOME=/workspace/tmp_cache \
-  --bind /scratch/users/ntu/es0001an/paper:/workspace \
+  --bind /scratch/users/yourinstitute/yourname/projectdirectory:/workspace \
   --bind /path/to/dataset:/dataset \
   /path/to/vllm-omni.sif \
   /workspace/container_venv/bin/python /workspace/benchmark_runner.py \
     --db /workspace/customer_db \
     --dataset /dataset \
-    --models qwen3omni \
+    --models cascade,qwen3omni,nemotron \
     --judge bertscore \
     --max-samples 500
 ```
