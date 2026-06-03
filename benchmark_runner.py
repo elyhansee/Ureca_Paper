@@ -56,16 +56,9 @@ import multiprocessing
 import subprocess
 from pathlib import Path
 
-# vLLM V1 engine uses subprocesses. Since CustomerDB/Judge initialize CUDA in 
-# the main process, forking causes a CUDA context corruption ("driver too old").
-# We force 'spawn' so child processes start with a clean CUDA context.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-# Disable anonymous usage telemetry to prevent container permission crashes
 os.environ["VLLM_NO_USAGE_STATS"] = "1"
 
-# Redirect Home, FlashInfer, and Triton JIT compilation caches to your writeable scratch
-# workspace. This prevents PermissionErrors inside Singularity container environments
-# where the default Home (~/.cache/) filesystem blocks runtime writes.
 os.environ["HOME"] = "/workspace/tmp_cache/home"
 os.environ["FLASHINFER_CACHE_DIR"] = "/workspace/tmp_cache/flashinfer"
 os.environ["TRITON_CACHE_DIR"] = "/workspace/tmp_cache/triton"
@@ -84,15 +77,9 @@ except RuntimeError:
 
 
 def _fix_cuda_visible_devices():
-    """
-    PBS/Slurm sometimes sets CUDA_VISIBLE_DEVICES to GPU UUIDs like
-    'GPU-a1b2c3...'. vLLM calls int() on these and crashes immediately.
-    This translates UUIDs to plain integer indices (0, 1, ...) before
-    anything else imports torch or vLLM.
-    """
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not ("GPU-" in cvd or "MIG-" in cvd):
-        return   # already integers, nothing to do
+        return
 
     try:
         out = subprocess.check_output(
@@ -131,14 +118,6 @@ _fix_cuda_visible_devices()
 
 
 def _disable_torch_compile_globally():
-    """
-    vLLM spawns subprocesses (via python -m) to inspect model architectures.
-    These subprocesses load vLLM -> deep_gemm -> torch.compile -> inductor.
-    Inductor crashes on some PyTorch versions with 'duplicate template name'
-    or missing 'mm_scaled'.
-    We globally disable torch.compile by injecting a sitecustomize.py into
-    PYTHONPATH, affecting this process and all child processes.
-    """
     patch_dir = Path.cwd() / ".vllm_patch"
     patch_dir.mkdir(exist_ok=True)
     site_file = patch_dir / "sitecustomize.py"
@@ -157,7 +136,6 @@ if os.environ.get("VLLM_DISABLE_TORCH_COMPILE") == "1":
             return fn
         torch.compile = _noop_compile
         
-        # Patch torch.prod on CUDA to bypass NVRTC compilation and resolve libnvrtc-builtins issues
         orig_prod = torch.Tensor.prod
         def patched_prod(self, *args, **kwargs):
             if self.is_cuda:
@@ -174,15 +152,10 @@ if os.environ.get("VLLM_DISABLE_TORCH_COMPILE") == "1":
     except Exception:
         pass
 
-# Ensure Home and JIT cache variables are redirected in child processes too
 os.environ["HOME"] = "/workspace/tmp_cache/home"
 os.environ["FLASHINFER_CACHE_DIR"] = "/workspace/tmp_cache/flashinfer"
 os.environ["TRITON_CACHE_DIR"] = "/workspace/tmp_cache/triton"
 
-# --- START OF VLLM OMNI PATCH ---
-# Uses a safe, built-in __import__ hook with a re-entrancy lock to patch target modules
-# as soon as they are loaded, keeping sys.modules as a pure dict
-# to prevent any C-extension (like pandas/numpy) import conflicts.
 try:
     _in_patch = False
     original_import = builtins.__import__
@@ -191,14 +164,12 @@ try:
         global _in_patch
         module = original_import(name, globals, locals, fromlist, level)
         
-        # Re-entrancy guard: if we are already inside the patcher, execute natively
         if _in_patch:
             return module
             
         if name == "transformers" or "vllm" in name:
             _in_patch = True
             try:
-                # Patch the vLLM Transformers Model Executor class methods if loaded
                 if "vllm.model_executor.models.transformers" in sys.modules:
                     tf_mod = sys.modules["vllm.model_executor.models.transformers"]
                     for attr_name in dir(tf_mod):
@@ -220,7 +191,6 @@ try:
                                 setattr(attr, "get_max_image_tokens", make_patched_method(original_method))
                                 print(f"[vLLM Patch] Successfully wrapped {attr_name}.get_max_image_tokens", flush=True)
                 
-                #Patch the lazy-loaded Qwen3OmniMoeProcessor and AutoModel Config Registry
                 if "transformers" in sys.modules:
                     trans_mod = sys.modules["transformers"]
                     if hasattr(trans_mod, "Qwen3OmniMoeProcessor"):
@@ -231,12 +201,10 @@ try:
                             cls._get_num_multimodal_tokens = _dummy_get_num_multimodal_tokens
                             print(f"\n[vLLM Patch] Dynamic Hook successfully injected _get_num_multimodal_tokens into {cls.__name__}\n", flush=True)
                     
-                    # Intercept and register the Qwen3 config mapping into the AutoModel base class
                     if hasattr(trans_mod, "Qwen3OmniMoeConfig") and hasattr(trans_mod, "AutoModel"):
                         config_cls = getattr(trans_mod, "Qwen3OmniMoeConfig")
                         auto_model_cls = getattr(trans_mod, "AutoModel")
                         
-                        # Only register if not already completed to prevent loop spamming
                         if not getattr(auto_model_cls, "_qwen3_registered", False):
                             model_cls = None
                             for target in ("Qwen3OmniMoeModel", "Qwen3OmniMoeForCausalLM", "Qwen3OmniMoeForConditionalGeneration"):
@@ -248,7 +216,6 @@ try:
                                 auto_model_cls._qwen3_registered = True
                                 print(f"\n[vLLM Patch] Registered {config_cls.__name__} under AutoModel with {model_cls.__name__}\n", flush=True)
 
-                    # Intercept and register the qwen3_5 config mapping into AutoConfig
                     if hasattr(trans_mod, "AutoConfig"):
                         auto_config_cls = getattr(trans_mod, "AutoConfig")
                         base_config = None
@@ -262,7 +229,6 @@ try:
                             auto_config_cls.register("qwen3_5", Qwen3_5Config)
                             print(f"\n[vLLM Patch] Registered qwen3_5 under AutoConfig inheriting from {base_config.__name__}\n", flush=True)
 
-                # Patch vLLM task configuration mappings
                 if "vllm.config" in sys.modules:
                     v_config = sys.modules["vllm.config"]
                     if hasattr(v_config, "_RUNNER_TASKS"):
@@ -279,30 +245,18 @@ try:
     builtins.__import__ = patched_import
 except Exception:
     pass
-# --- END OF VLLM OMNI PATCH ---
-
-try:
-    patch_dir = os.path.dirname(__file__)
-    if patch_dir in sys.path:
-        sys.path.remove(patch_dir)
-    import sitecustomize
-    sys.path.insert(0, patch_dir)
-except ImportError:
-    pass
 """
     site_file.write_text(code.strip())
     
     curr = os.environ.get("PYTHONPATH", "")
     abs_patch_dir = str(patch_dir.absolute())
     
-    # Avoid duplicate additions to PYTHONPATH
     if abs_patch_dir not in curr.split(":"):
         os.environ["PYTHONPATH"] = f"{abs_patch_dir}:{curr}" if curr else abs_patch_dir
         
     os.environ["VLLM_DISABLE_TORCH_COMPILE"] = "1"
     os.environ["TORCH_COMPILE_DISABLE"] = "1"
     
-    # Apply to current process immediately (Safe to import torch now!)
     import torch
     def _noop_compile(fn=None, *args, **kwargs):
         if fn is None: return lambda f: f
@@ -310,7 +264,6 @@ except ImportError:
     torch.compile = _noop_compile
     
     try:
-        # Patch torch.prod on CUDA for the parent process
         orig_prod = torch.Tensor.prod
         def patched_prod(self, *args, **kwargs):
             if self.is_cuda:
@@ -331,9 +284,6 @@ except ImportError:
 _disable_torch_compile_globally()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Suppress Transformers v4 deprecation noise ────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -344,9 +294,6 @@ import logging
 logging.getLogger("vllm").setLevel(logging.ERROR)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Standard imports (after all patches) ─────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 import gc
 import re
 import json
@@ -373,15 +320,7 @@ from hallucination_judge import HallucinationJudge, JudgeConfig
 SEED = 42
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Parent process config registration hook ───────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 def _register_compat_architectures():
-    """
-    Directly patch the main thread's local transformers instance in case standard
-    imports require config translation for qwen3_5. Also patch task mappings 
-    in parent process if vllm is subsequently imported.
-    """
     try:
         if hasattr(transformers, "AutoConfig"):
             ac = transformers.AutoConfig
@@ -411,15 +350,12 @@ def _register_compat_architectures():
 _register_compat_architectures()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Model catalogue ───────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class ModelConfig:
     tag:             str
     display_name:    str
     model_id:        str
-    architecture:    str        # "omni" | "nemotron_omni" | "cascade"
+    architecture:    str        
     asr_model_id:    Optional[str] = None
     dtype:           str = "bfloat16"
     gpu_memory_util: float = 0.80
@@ -431,7 +367,6 @@ class ModelConfig:
 
 
 MODEL_CATALOGUE: Dict[str, ModelConfig] = {
-    # ── Qwen3-Omni-30B-A3B-Instruct AWQ 4-bit (2026) ──────────────────────────
     "qwen3omni": ModelConfig(
         tag="qwen3omni",
         display_name="Qwen3-Omni-30B-A3B-AWQ",
@@ -442,19 +377,17 @@ MODEL_CATALOGUE: Dict[str, ModelConfig] = {
         limit_mm={"audio": 1},
         extra_kwargs={"enforce_eager": True, "quantization": "compressed-tensors"},
     ),
-    # ── NVIDIA Nemotron-3-Nano-Omni-30B-FP8 (April 2026) ──────────────────────
     "nemotron": ModelConfig(
         tag="nemotron",
         display_name="Nemotron-3-Nano-Omni-30B-BF16",
         model_id="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
         architecture="nemotron_omni",
         gpu_memory_util=0.85,
-        max_model_len=8192,  # Cap context length slightly to preserve VRAM budget for KV Cache
+        max_model_len=8192,  
         trust_remote=True,
         limit_mm={"audio": 1},
         extra_kwargs={"enforce_eager": True},
     ),
-    # ── Cascade baseline: Qwen2.5-7B-Instruct (Natively Supported) ────────────
     "cascade": ModelConfig(
         tag="cascade",
         display_name="Qwen2.5-7B-Instruct",
@@ -467,9 +400,6 @@ MODEL_CATALOGUE: Dict[str, ModelConfig] = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── System prompt ────────────────────────────────═════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant for a telecom company.\n"
     "IMPORTANT: If the user mentions a phone number OR asks to look up, "
@@ -499,9 +429,6 @@ LOOKUP_KEYWORDS = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Latency record ────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class LatencyRecord:
     sample_id:        str
@@ -517,9 +444,6 @@ class LatencyRecord:
     status:           str   = "success"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Helpers ────────────────────────────────═══════════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
 def parse_tool_call(text: str) -> Optional[Tuple[str, Dict]]:
     text = text.strip()
     if "function_call" in text:
@@ -563,7 +487,6 @@ def load_audio(path: str) -> Optional[Tuple[np.ndarray, int]]:
         return None
 
 
-# ── labels.json-aware infer_label ─────────────────────────────────────────────
 _LABELS_CACHE: Optional[Dict] = None
 
 def _load_labels(dataset_dir: str) -> Dict:
@@ -580,11 +503,6 @@ def _load_labels(dataset_dir: str) -> Dict:
 
 
 def infer_label(filename: str, dataset_dir: str = "") -> SampleLabel:
-    """
-    Priority:
-      1. labels.json in dataset_dir (Banking77, injected test sets, etc.)
-      2. Filename convention: lookup_<phone>_*.wav / general_*.wav
-    """
     base   = Path(filename).stem
     labels = _load_labels(dataset_dir) if dataset_dir else {}
 
@@ -597,7 +515,6 @@ def infer_label(filename: str, dataset_dir: str = "") -> SampleLabel:
             ground_truth_id=entry.get("customer_id"),
         )
 
-    # Filename fallback
     base_lower = base.lower()
     if base_lower.startswith("lookup_"):
         parts = base_lower.split("_")
@@ -607,9 +524,6 @@ def infer_label(filename: str, dataset_dir: str = "") -> SampleLabel:
     return SampleLabel(sample_id=base, requires_tool=False)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Model runners ────────────────────────────────═════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
 class BaseRunner:
     def __init__(self, config: ModelConfig):
         self.config = config
@@ -625,11 +539,6 @@ class BaseRunner:
         raise NotImplementedError
 
     def _get_llm(self, **extra):
-        """
-        Lazy-imports vLLM and constructs LLM.
-        Importing here (not at module level) means all patches above are
-        already active before vLLM's module-level code runs.
-        """
         from vllm import LLM
         cfg = self.config
         kwargs = dict(
@@ -645,6 +554,7 @@ class BaseRunner:
             kwargs["limit_mm_per_prompt"] = cfg.limit_mm
         kwargs.update(cfg.extra_kwargs)
         kwargs.update(extra)
+        kwargs['skip_mm_profiling'] = True
         return LLM(**kwargs)
 
     def _get_sampling_params(self, max_tokens: int = 512):
@@ -655,6 +565,12 @@ class BaseRunner:
             repetition_penalty=1.05,
         )
 
+    def _get_prefill_params(self):
+        from vllm.sampling_params import SamplingParams
+        return SamplingParams(
+            temperature=0.0, max_tokens=1, seed=SEED
+        )
+
     def _unload_llm(self):
         if hasattr(self, "llm"):
             del self.llm
@@ -663,7 +579,6 @@ class BaseRunner:
             torch.cuda.empty_cache()
 
 
-# ── Qwen3-Omni runner ─────────────────────────────────────────────────────────
 class Qwen3OmniRunner(BaseRunner):
     def load(self):
         print(f"  [LOAD] {self.config.model_id}")
@@ -691,18 +606,25 @@ class Qwen3OmniRunner(BaseRunner):
     def run_sample(self, audio: np.ndarray, sr: int,
                    tool_result: str = "") -> Tuple[str, Dict]:
         prompt = self._make_prompt(audio, sr, tool_result)
-        t0     = time.perf_counter()
-        out    = self.llm.generate([prompt], self.params)
-        ms     = (time.perf_counter() - t0) * 1000
+        
+        t_start = time.perf_counter()
+        _ = self.llm.generate([prompt], self._get_prefill_params())
+        ttft_ms = (time.perf_counter() - t_start) * 1000
+
+        t_decode_start = time.perf_counter()
+        out = self.llm.generate([prompt], self.params)
+        total_ms = (time.perf_counter() - t_start) * 1000
+
+        decode_ms = total_ms - ttft_ms
+
         return out[0].outputs[0].text, {
-            "asr_ms":    round(ms * 0.18, 2),
-            "ttft_ms":   round(ms * 0.08, 2),
-            "decode_ms": round(ms * 0.74, 2),
-            "e2e_ms":    round(ms, 2),
+            "asr_ms":    0.0,
+            "ttft_ms":   round(ttft_ms, 2),
+            "decode_ms": round(decode_ms, 2),
+            "e2e_ms":    round(total_ms, 2),
         }
 
 
-# ── Nemotron-3-Nano-Omni runner ───────────────────────────────────────────────
 class NemotronOmniRunner(BaseRunner):
     def load(self):
         print(f"  [LOAD] {self.config.model_id}")
@@ -730,25 +652,31 @@ class NemotronOmniRunner(BaseRunner):
     def run_sample(self, audio: np.ndarray, sr: int,
                    tool_result: str = "") -> Tuple[str, Dict]:
         prompt = self._make_prompt(audio, sr, tool_result)
-        t0     = time.perf_counter()
-        out    = self.llm.generate([prompt], self.params)
-        ms     = (time.perf_counter() - t0) * 1000
+        
+        t_start = time.perf_counter()
+        _ = self.llm.generate([prompt], self._get_prefill_params())
+        ttft_ms = (time.perf_counter() - t_start) * 1000
+
+        t_decode_start = time.perf_counter()
+        out = self.llm.generate([prompt], self.params)
+        total_ms = (time.perf_counter() - t_start) * 1000
+
+        decode_ms = total_ms - ttft_ms
+
         return out[0].outputs[0].text, {
-            "asr_ms":    round(ms * 0.12, 2),
-            "ttft_ms":   round(ms * 0.07, 2),
-            "decode_ms": round(ms * 0.81, 2),
-            "e2e_ms":    round(ms, 2),
+            "asr_ms":    0.0,
+            "ttft_ms":   round(ttft_ms, 2),
+            "decode_ms": round(decode_ms, 2),
+            "e2e_ms":    round(total_ms, 2),
         }
 
 
-# ── Cascade baseline: Whisper-large-v3 → Qwen2.5-7B (Highly Compatible) ──────
 class CascadeRunner(BaseRunner):
     def load(self):
         import whisper
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model_name = (self.config.asr_model_id or "openai/whisper-large-v3").split("/")[-1]
         
-        # Strip whisper- prefix for openai-whisper package compatibility
         if model_name.startswith("whisper-"):
             model_name = model_name.replace("whisper-", "")
             
@@ -782,17 +710,23 @@ class CascadeRunner(BaseRunner):
         )["text"].strip()
         asr_ms = (time.perf_counter() - t_asr) * 1000
 
+        prompt = self._make_llm_prompt(transcript, tool_result)
+
+        t_prefill = time.perf_counter()
+        _ = self.llm.generate([prompt], self._get_prefill_params())
+        ttft_ms = (time.perf_counter() - t_prefill) * 1000
+
         t_llm = time.perf_counter()
-        out   = self.llm.generate(
-            [self._make_llm_prompt(transcript, tool_result)], self.params
-        )
-        llm_ms = (time.perf_counter() - t_llm) * 1000
+        out   = self.llm.generate([prompt], self.params)
+        total_llm_ms = (time.perf_counter() - t_llm) * 1000
+
+        decode_ms = total_llm_ms - ttft_ms
 
         return out[0].outputs[0].text, {
             "asr_ms":    round(asr_ms, 2),
-            "ttft_ms":   round(llm_ms * 0.15, 2),
-            "decode_ms": round(llm_ms * 0.85, 2),
-            "e2e_ms":    round(asr_ms + llm_ms, 2),
+            "ttft_ms":   round(ttft_ms, 2),
+            "decode_ms": round(decode_ms, 2),
+            "e2e_ms":    round(asr_ms + total_llm_ms, 2),
         }
 
 
@@ -803,9 +737,6 @@ RUNNER_MAP = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CSV tracer ────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 TRACE_HEADERS = [
     "sample_id", "model_tag", "status", "stage",
     "asr_ms", "ttft_ms", "faiss_ms", "tool_exec_ms", "decode_ms", "e2e_ms",
@@ -822,9 +753,6 @@ def append_trace(path: str, row: Dict):
         w.writerow({h: row.get(h, "") for h in TRACE_HEADERS})
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Main benchmark loop ───────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 def run_model_benchmark(
     model_cfg:    ModelConfig,
     audio_items:  List[Tuple],
@@ -844,7 +772,7 @@ def run_model_benchmark(
     latencies: List[LatencyRecord] = []
 
     items = audio_items[:max_samples] if max_samples > 0 else audio_items
-    # ── Resume from checkpoint ────────────────────────────────────────────────
+    
     already_done = set()
     if trace_path and os.path.exists(trace_path):
         try:
@@ -853,7 +781,6 @@ def run_model_benchmark(
                 for row in _csv.DictReader(f):
                     status = row.get("status", "")
                     if status.startswith("success") or status == "success":
-                        # 1. Reconstruct Latency Record
                         lr = LatencyRecord(
                             sample_id=row["sample_id"],
                             model_tag=row["model_tag"],
@@ -869,7 +796,6 @@ def run_model_benchmark(
                         )
                         latencies.append(lr)
                         
-                        # 2. Reconstruct Accuracy & FAISS metrics
                         label = infer_label(row["sample_id"], dataset_dir)
                         if row.get("tool_called") == "True" or row.get("tool_called") is True:
                             try:
@@ -884,7 +810,6 @@ def run_model_benchmark(
                                 true_tool=label.requires_tool,
                             ))
                         
-                        # 3. Restore Hallucination scores
                         h_val = row.get("hallucination_score")
                         if h_val:
                             try:
@@ -900,6 +825,7 @@ def run_model_benchmark(
                     f"resuming from {len(items)} remaining")
         except Exception as e:
             print(f"  [RESUME] Could not read traces: {e}")
+            
     RunnerClass = RUNNER_MAP.get(model_cfg.architecture)
     if RunnerClass is None:
         raise ValueError(f"Unknown architecture: {model_cfg.architecture}")
@@ -917,7 +843,6 @@ def run_model_benchmark(
         label = infer_label(path, dataset_dir)
         t_e2e = time.perf_counter()
 
-        # ── Stage 1: Plan ─────────────────────────────────────────────────────
         try:
             plan_text, plan_timing = runner.run_sample(audio, sr)
         except Exception as e:
@@ -954,7 +879,6 @@ def run_model_benchmark(
                   f"e2e={lr.e2e_ms:.0f}ms  stage=direct")
             continue
 
-        # ── Stage 2: Tool execution ───────────────────────────────────────────
         tool_name, tool_args = tc
         tool_result_str, tool_timing = executor.execute(
             tool_name, tool_args, label=label
@@ -968,7 +892,6 @@ def run_model_benchmark(
         except Exception:
             result_obj, faiss_dist = None, ""
 
-        # ── Stage 3: Synthesis ────────────────────────────────────────────────
         try:
             synth_text, synth_timing = runner.run_sample(
                 audio, sr, tool_result=tool_result_str
@@ -980,7 +903,6 @@ def run_model_benchmark(
                 plan_text, plan_timing, f"SynthFail:{type(e).__name__}"
             )
 
-        # ── Hallucination score ───────────────────────────────────────────────
         h_score = None
         if hasattr(judge, "score"):
             record_for_judge = (
@@ -1011,7 +933,6 @@ def run_model_benchmark(
         (out_dir / f"{base}_synthesis.txt").write_text(synth_text)
         latencies.append(lr)
         
-        # Evaluate formatted hallucination string prior to interpolation inside print log
         h_str = f"{h_score:.3f}" if h_score is not None else "N/A"
         print(f"  [{idx+1:>4}/{len(items)}] {base}  "
               f"e2e={lr.e2e_ms:.0f}ms  stage=tool_synthesis  "
@@ -1019,7 +940,6 @@ def run_model_benchmark(
 
     runner.unload()
 
-    # ── Latency percentiles ───────────────────────────────────────────────────
     def pct(vals: List[float]) -> Dict:
         if not vals:
             return {f"p{p}": None for p in [50, 75, 90, 95, 99]}
@@ -1051,9 +971,6 @@ def run_model_benchmark(
     return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── Entry point ───────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db",          default="./customer_db")
@@ -1072,6 +989,16 @@ def main():
 
     print("[INIT] Loading customer DB...")
     db = CustomerDB(db_dir=args.db, device=args.device)
+
+    print("[INIT] Warming up database embedding engine...")
+    try:
+        if hasattr(db, "embed") and hasattr(db, "search"):
+            _ = db.search(db.embed("warmup query"), k=1)
+        elif hasattr(db, "index") and hasattr(db, "model"):
+            _ = db.index.search(db.model.encode("warmup query"), k=1)
+        print("  Embedding engine warmed up successfully.")
+    except Exception as e:
+        print(f"  [WARN] Warmup bypassed (non-critical execution profile): {e}")
 
     print(f"[INIT] Building hallucination judge: {args.judge}")
     if args.judge == "none":
@@ -1098,7 +1025,6 @@ def main():
     import random
     random.seed(42)
     
-    # Stratified split to guarantee a perfect 50/50 mix
     lookup_items = [x for x in items if x[0].lower().startswith("lookup_") or x[0].lower().startswith("tool_")]
     general_items = [x for x in items if x[0].lower().startswith("general_")]
     
@@ -1110,7 +1036,6 @@ def main():
         interleaved.append(l)
         interleaved.append(g)
         
-    # Append any remaining files
     min_len = min(len(lookup_items), len(general_items))
     leftovers = lookup_items[min_len:] + general_items[min_len:]
     random.shuffle(leftovers)
