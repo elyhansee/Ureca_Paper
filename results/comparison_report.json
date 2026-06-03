@@ -50,25 +50,25 @@
     },
     "accuracy": {
       "tool_selection": {
-        "precision": 0.9565,
-        "recall": 0.88,
-        "f1": 0.9167,
-        "tp": 88,
+        "precision": 0.957,
+        "recall": 0.89,
+        "f1": 0.9223,
+        "tp": 89,
         "fp": 4,
-        "fn": 12,
+        "fn": 11,
         "tn": 396,
         "n_total": 500
       },
       "retrieval": {
-        "hit_rate@1": 0.9773,
-        "hit_rate@3": 0.9773,
-        "hit_rate@5": 0.9773,
-        "n_retrieval_samples": 88
+        "hit_rate@1": 0.9775,
+        "hit_rate@3": 0.9775,
+        "hit_rate@5": 0.9775,
+        "n_retrieval_samples": 89
       },
       "synthesis": {
-        "mean_hallucination_score": 0.1225,
-        "std_hallucination_score": 0.1343,
-        "n_judged": 92,
+        "mean_hallucination_score": 0.1163,
+        "std_hallucination_score": 0.1357,
+        "n_judged": 93,
         "fully_accurate_pct": 0.0
       }
     }
@@ -198,13 +198,13 @@
     },
     "accuracy": {
       "tool_selection": {
-        "precision": 0.8807,
+        "precision": 0.8496,
         "recall": 1.0,
-        "f1": 0.9366,
+        "f1": 0.9187,
         "tp": 96,
-        "fp": 13,
+        "fp": 17,
         "fn": 0,
-        "tn": 387,
+        "tn": 383,
         "n_total": 496
       },
       "retrieval": {
@@ -214,9 +214,9 @@
         "n_retrieval_samples": 96
       },
       "synthesis": {
-        "mean_hallucination_score": 0.1406,
-        "std_hallucination_score": 0.1153,
-        "n_judged": 109,
+        "mean_hallucination_score": 0.1347,
+        "std_hallucination_score": 0.1145,
+        "n_judged": 113,
         "fully_accurate_pct": 0.0
       }
     }
