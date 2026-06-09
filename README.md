@@ -205,8 +205,8 @@ singularity exec --nv \
   title     = {Empirical Evaluation of End-to-End Multimodal Speech-Language Models
                vs. Cascade Pipelines on Constrained Telecom Retrieval Tasks},
   author    = {Lee, Esther Yi Shan and Ustiugov, Dmitrii and Chen, Wenyan and Liu, Hongrui},
-  journal   = {Proceedings of URECA@NTU 2024--25},
-  year      = {2025}
+  journal   = {Proceedings of URECA@NTU 2025--26},
+  year      = {2026}
 }
 ```
 
