@@ -34,12 +34,12 @@ Audio Input
 | File / Folder | Purpose |
 |---|---|
 | `generate_customer_db.py` | Generates synthetic 1M customer DB + FAISS IVFFlat index |
-| `generate_test_audio.py`	| Generates synthetic speech queries (audio waveforms) + labels via local TTS |
-| `combine_datasets.py` | Consolidates synthetic tool-use speech waveforms and labels into your main |
+| `generate_test.py` | Generates synthetic speech queries (audio waveforms) + labels via local TTS |
+| `combine_datasets.py` | Consolidates synthetic tool-use speech waveforms and labels into your main dataset |
 | `retrieval_engine.py` | CustomerDB logic, AccuracyTracker, and ToolExecutor |
 | `hallucination_judge.py` | BERTScore + LLM-as-Judge hallucination scorer |
 | `benchmark_runner.py` | Multi-model benchmarking with granular latency tracing |
-| `results/` | Pre-computed benchmark results (comparison_report.json) and Rendered evaluation charts for the publication |
+| `results/` | Pre-computed benchmark results (`comparison_report.json`) and rendered evaluation charts for the publication |
 
 ---
 
@@ -59,8 +59,8 @@ This pipeline relies on customized, dynamic vLLM and transformers hooks to suppo
 
 | Model | Mean E2E | Tool F1 | HR@1 | Halluc. Score |
 |---|---|---|---|---|
-| Cascade Baseline | **5,529ms** | 0.917 | 0.977 | 0.123 |
-| Qwen3-Omni-30B-AWQ | 8,732ms | 0.937 | **1.000** | 0.141 |
+| Cascade (Qwen2.5-7B-Instruct) | **5,529ms** | 0.922 | 0.978 | 0.116 |
+| Qwen3-Omni-30B-AWQ | 8,732ms | 0.919 | **1.000** | 0.135 |
 | Nemotron-3-Nano-Omni-BF16 | 52,593ms | **0.985** | 0.856 | **0.009** |
 
 Full per-sample traces and latency percentiles available in `results/`.
@@ -73,7 +73,7 @@ Full per-sample traces and latency percentiles available in `results/`.
 
 Measures whether the LLM correctly decides to call `lookup_customer` vs. answer directly.
 
-- **Ground truth:** Inferred from filename (`lookup_<phone>_*.wav` → tool required)
+- **Ground truth:** Inferred from filename prefix (`tool_*.wav` → tool required, `general_*.wav` → direct answer)
 
 ### 2. FAISS Retrieval — Hit-Rate@K
 
@@ -89,7 +89,7 @@ Reported for K = 1, 3, 5.
 
 Two available backends:
 
-- **BERTScore** (fast, ~100ms/sample): Embeds final response + flattened customer record with DeBERTa-XL.
+- **BERTScore** (fast, ~100ms/sample): Embeds final response + flattened customer record with DeBERTa-XL, rescaled against the DeBERTa-xlarge-mnli corpus so that 0 = perfect factual alignment and 1 = complete semantic deviation.
 - **LLM-as-Judge** (thorough, ~2s/sample): Prompts a small judge model (Qwen2.5-3B) with a strict 0–10 rubric, normalized to [0, 1].
 
 ---
@@ -124,7 +124,10 @@ pip install vllm-omni faiss-gpu-cu12 av
 python generate_customer_db.py --n 1_000_000 --out ./customer_db
 
 # Synthesize the 100 tool-use audio files and tool_labels.json
-python generate_test_audio.py
+python generate_test.py
+
+# Download 400 general Banking77 queries and convert to WAV
+python download_banking77.py --out ./audio_banking77 --split test --max 400
 
 # Merge the synthetic dataset and tool labels into ./dataset/labels.json
 python combine_datasets.py
@@ -192,7 +195,7 @@ singularity exec --nv \
 
 - **HPC Cache Redirection:** Triton JIT, FlashInfer, and HuggingFace caches are forcibly redirected to `/workspace/tmp_cache/` to prevent `PermissionError` crashes inside strictly sandboxed Singularity containers.
 
-- **Stratified Balanced Sampling:** Audio files are split into lookup and general buckets, interleaved 50/50, and deterministically shuffled with a fixed seed — guaranteeing a balanced mix even under `--max-samples` truncation.
+- **Stratified Interleaved Sampling:** The evaluation dataset uses a fixed 20/80 stratification ratio — 100 tool-use lookup queries (5 customer profiles × 20 conversational templates, synthesized with pyttsx3) interleaved with 400 general Banking77 queries (synthesized with gTTS). Files are deterministically shuffled with a fixed seed to guarantee a reproducible mix under `--max-samples` truncation.
 
 - **IVFFlat over Flat:** At 1M records, exact `IndexFlatL2` takes 500ms–5s per search. IVFFlat reduces this to 5–60ms while maintaining >95% recall vs. exact search.
 
@@ -201,9 +204,9 @@ singularity exec --nv \
 ## Citation
 
 ```bibtex
-@article{lee2025telecomaudio,
-  title     = {Empirical Evaluation of End-to-End Multimodal Speech-Language Models
-               vs. Cascade Pipelines on Constrained Telecom Retrieval Tasks},
+@article{lee2026whennative,
+  title     = {When Do Native Speech-Language Models Beat Cascades?
+               A Latency--Accuracy Study of Constrained Telecom Retrieval},
   author    = {Lee, Esther Yi Shan and Ustiugov, Dmitrii and Chen, Wenyan and Liu, Hongrui},
   journal   = {Proceedings of URECA@NTU 2025--26},
   year      = {2026}
