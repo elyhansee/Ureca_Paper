@@ -1042,7 +1042,7 @@ def main():
     interleaved.extend(leftovers)
     
     items[:] = interleaved
-    print(f"  [INFO] Stratified and interleaved {len(lookup_items)} lookup and {len(general_items)} general files to guarantee a perfect 50/50 mix.")
+    print(f"  [INFO] Stratified and interleaved {len(lookup_items)} lookup and {len(general_items)} general files ({len(lookup_items)/(len(lookup_items)+len(general_items))*100:.0f}/{len(general_items)/(len(lookup_items)+len(general_items))*100:.0f} mix).")
     if not items:
         print("[ERROR] No valid audio files. Exiting.")
         return
